@@ -62,6 +62,8 @@ end
 -- UART I/O settings
 if tup.getconfig("UART_PROTOCOL") == "native" then
     FLAGS += "-DUART_PROTOCOL_NATIVE"
+elseif tup.getconfig("UART_PROTOCOL") == "touchbot" then
+    FLAGS += "-DUART_PROTOCOL_TOUCHBOT"
 elseif tup.getconfig("UART_PROTOCOL") == "ascii" or tup.getconfig("UART_PROTOCOL") == "" then
     FLAGS += "-DUART_PROTOCOL_ASCII"
 elseif tup.getconfig("UART_PROTOCOL") == "stdout" then
@@ -171,6 +173,7 @@ build{
         'MotorControl/main.cpp',
         'communication/communication.cpp',
         'communication/ascii_protocol.cpp',
+        'communication/touchbot_protocol.cpp',
         'communication/interface_uart.cpp',
         'communication/interface_usb.cpp',
         'communication/interface_can.cpp',

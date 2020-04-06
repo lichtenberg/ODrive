@@ -2,6 +2,7 @@
 #include "interface_uart.h"
 
 #include "ascii_protocol.hpp"
+#include "touchbot_protocol.hpp"
 
 #include <MotorControl/utils.h>
 
@@ -74,15 +75,25 @@ static void uart_server_thread(void * ctx) {
         if (new_rcv_idx < dma_last_rcv_idx) {
             uart4_stream_input.process_bytes(dma_rx_buffer + dma_last_rcv_idx,
                     UART_RX_BUFFER_SIZE - dma_last_rcv_idx, nullptr); // TODO: use process_all
+#ifdef UART_PROTOCOL_TOUCHBOT
+            touchbot_protocol_parse_stream(dma_rx_buffer + dma_last_rcv_idx,
+                    UART_RX_BUFFER_SIZE - dma_last_rcv_idx, uart4_stream_output);
+#else
             ASCII_protocol_parse_stream(dma_rx_buffer + dma_last_rcv_idx,
                     UART_RX_BUFFER_SIZE - dma_last_rcv_idx, uart4_stream_output);
+#endif
             dma_last_rcv_idx = 0;
         }
         if (new_rcv_idx > dma_last_rcv_idx) {
             uart4_stream_input.process_bytes(dma_rx_buffer + dma_last_rcv_idx,
                     new_rcv_idx - dma_last_rcv_idx, nullptr); // TODO: use process_all
+#ifdef UART_PROTOCOL_TOUCHBOT
+            touchbot_protocol_parse_stream(dma_rx_buffer + dma_last_rcv_idx,
+                    new_rcv_idx - dma_last_rcv_idx, uart4_stream_output);
+#else
             ASCII_protocol_parse_stream(dma_rx_buffer + dma_last_rcv_idx,
                     new_rcv_idx - dma_last_rcv_idx, uart4_stream_output);
+#endif
             dma_last_rcv_idx = new_rcv_idx;
         }
 
