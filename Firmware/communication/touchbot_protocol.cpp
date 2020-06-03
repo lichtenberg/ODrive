@@ -25,314 +25,306 @@
 #define TO_STR(s) TO_STR_INNER(s)
 
 /* Private variables ---------------------------------------------------------*/
+
+#include "tcpacket.h"
+
+#define RXSTATE_SYNC0   0
+#define RXSTATE_SYNC1   1
+#define RXSTATE_SYNC2   2
+#define RXSTATE_SYNC3   3
+#define RXSTATE_HEADER  4
+#define RXSTATE_PAYLOAD 5
+
+static tcpacket_t rxpacket;             // no packet pool yet, this is our RX buffer
+static tcpacket_t txpacket;             // ditto, this is our TX buffer
+
+static uint8_t *rxPtr;                  // state to track our packet receive.
+static int rxRemlen = 0;
+static int rxState = RXSTATE_SYNC0;
+
+
+
 /* Private function prototypes -----------------------------------------------*/
 /* Function implementations --------------------------------------------------*/
 
 // @brief Sends a line on the specified output.
-template<typename ... TArgs>
-void tprespond(StreamSink& output, bool include_checksum, const char * fmt, TArgs&& ... args) {
-    char response[64];
-    size_t len = snprintf(response, sizeof(response), fmt, std::forward<TArgs>(args)...);
-    output.process_bytes((uint8_t*)response, len, nullptr); // TODO: use process_all instead
-    if (include_checksum) {
-        uint8_t checksum = 0;
-        for (size_t i = 0; i < len; ++i)
-            checksum ^= response[i];
-        len = snprintf(response, sizeof(response), "*%u", checksum);
-        output.process_bytes((uint8_t*)response, len, nullptr);
-    }
-    output.process_bytes((const uint8_t*)"\r\n", 2, nullptr);
+
+static void tprespond(StreamSink& output, tcpacket_t *pkt)
+{
+    size_t len = tcpkt_size(pkt);
+    output.process_bytes((uint8_t*)pkt, len, nullptr); // TODO: use process_all instead
 }
 
 
-// @brief Executes an ASCII protocol command
-// @param buffer buffer of ASCII encoded characters
-// @param len size of the buffer
-void touchbot_protocol_process_line(const uint8_t* buffer, size_t len, StreamSink& response_channel) {
+static void touchbot_protocol_process_packet(tcpacket_t *rxpkt, StreamSink& response_channel) 
+{
+    tcpacket_t *txpkt = &txpacket;
     static_assert(sizeof(char) == sizeof(uint8_t));
+    unsigned int a;
+    float f0,f1;
+    int32_t i0;
+    Axis *axis;
+    char *pname;
+    Endpoint *endpoint;
 
-    // scan line to find beginning of checksum and prune comment
-    uint8_t checksum = 0;
-    size_t checksum_start = SIZE_MAX;
-    for (size_t i = 0; i < len; ++i) {
-        if (buffer[i] == ';') { // ';' is the comment start char
-            len = i;
+    // Prep the response packet.  Copy over the sequence # and command from the RX packet.
+    tcpkt_init(txpkt);
+    txpkt->packet.tc_sts = TCSTS_OK;
+    txpkt->packet.tc_cmd = rxpkt->packet.tc_cmd | TCCMD_RESPBIT;
+    txpkt->packet.tc_seq = rxpkt->packet.tc_seq;
+
+    // Handle each command type.
+    // We don't do much about badly formed packets... yet.
+    switch (rxpkt->packet.tc_cmd) {
+        case TCCMD_PING:
             break;
-        }
-        if (checksum_start > i) {
-            if (buffer[i] == '*') {
-                checksum_start = i + 1;
+
+        case TCCMD_POSITION:
+            a = (unsigned int) tcpkt_getint(rxpkt,0);       // selected axis
+
+            if (a < AXIS_COUNT) {
+                f0 = tcpkt_getfloat(rxpkt,0);      // target position
+                axis = axes[a];
+                axis->controller_.set_pos_setpoint(f0, 0.0, 0.0);
+                axis->watchdog_feed();
             } else {
-                checksum ^= buffer[i];
+                txpkt->packet.tc_sts = TCSTS_ERR_PARAM;
             }
-        }
-    }
+            break;
+            
+        case TCCMD_POSLIMITS:
+            a = (unsigned int) tcpkt_getint(rxpkt,0);       // selected axis
 
-    // copy everything into a local buffer so we can insert null-termination
-    char cmd[MAX_LINE_LENGTH + 1];
-    if (len > MAX_LINE_LENGTH) len = MAX_LINE_LENGTH;
-    memcpy(cmd, buffer, len);
-
-    // optional checksum validation
-    bool use_checksum = (checksum_start < len);
-    if (use_checksum) {
-        unsigned int received_checksum;
-        sscanf((const char *)cmd + checksum_start, "%u", &received_checksum);
-        if (received_checksum != checksum)
-            return;
-        len = checksum_start - 1; // prune checksum and asterisk
-    }
-
-    cmd[len] = 0; // null-terminate
-
-    // check incoming packet type
-    if (cmd[0] == 'p') { // position control
-        unsigned motor_number;
-        float pos_setpoint, vel_feed_forward, current_feed_forward;
-        int numscan = sscanf(cmd, "p %u %f %f %f", &motor_number, &pos_setpoint, &vel_feed_forward, &current_feed_forward);
-        if (numscan < 2) {
-            tprespond(response_channel, use_checksum, "invalid command format");
-        } else if (motor_number >= AXIS_COUNT) {
-            tprespond(response_channel, use_checksum, "invalid motor %u", motor_number);
-        } else {
-            if (numscan < 3)
-                vel_feed_forward = 0.0f;
-            if (numscan < 4)
-                current_feed_forward = 0.0f;
-            Axis* axis = axes[motor_number];
-            axis->controller_.set_pos_setpoint(pos_setpoint, vel_feed_forward, current_feed_forward);
-            axis->watchdog_feed();
-        }
-
-    } else if (cmd[0] == 'q') { // position control with limits
-        unsigned motor_number;
-        float pos_setpoint, vel_limit, current_lim;
-        int numscan = sscanf(cmd, "q %u %f %f %f", &motor_number, &pos_setpoint, &vel_limit, &current_lim);
-        if (numscan < 2) {
-            tprespond(response_channel, use_checksum, "invalid command format");
-        } else if (motor_number >= AXIS_COUNT) {
-            tprespond(response_channel, use_checksum, "invalid motor %u", motor_number);
-        } else {
-            Axis* axis = axes[motor_number];
-            axis->controller_.pos_setpoint_ = pos_setpoint;
-            if (numscan >= 3)
-                axis->controller_.config_.vel_limit = vel_limit;
-            if (numscan >= 4)
-                axis->motor_.config_.current_lim = current_lim;
-
-            axis->watchdog_feed();
-        }
-
-    } else if (cmd[0] == 'v') { // velocity control
-        unsigned motor_number;
-        float vel_setpoint, current_feed_forward;
-        int numscan = sscanf(cmd, "v %u %f %f", &motor_number, &vel_setpoint, &current_feed_forward);
-        if (numscan < 2) {
-            tprespond(response_channel, use_checksum, "invalid command format");
-        } else if (motor_number >= AXIS_COUNT) {
-            tprespond(response_channel, use_checksum, "invalid motor %u", motor_number);
-        } else {
-            if (numscan < 3)
-                current_feed_forward = 0.0f;
-            Axis* axis = axes[motor_number];
-            axis->controller_.set_vel_setpoint(vel_setpoint, current_feed_forward);
-            axis->watchdog_feed();
-        }
-
-    } else if (cmd[0] == 'c') { // current control
-        unsigned motor_number;
-        float current_setpoint;
-        int numscan = sscanf(cmd, "c %u %f", &motor_number, &current_setpoint);
-        if (numscan < 2) {
-            tprespond(response_channel, use_checksum, "invalid command format");
-        } else if (motor_number >= AXIS_COUNT) {
-            tprespond(response_channel, use_checksum, "invalid motor %u", motor_number);
-        } else {
-            Axis* axis = axes[motor_number];
-            axis->controller_.set_current_setpoint(current_setpoint);
-            axis->watchdog_feed();
-        }
-
-    } else if (cmd[0] == 't') { // trapezoidal trajectory
-        unsigned motor_number;
-        float goal_point;
-        int numscan = sscanf(cmd, "t %u %f", &motor_number, &goal_point);
-        if (numscan < 2) {
-            tprespond(response_channel, use_checksum, "invalid command format");
-        } else if (motor_number >= AXIS_COUNT) {
-            tprespond(response_channel, use_checksum, "invalid motor %u", motor_number);
-        } else {
-            Axis* axis = axes[motor_number];
-            axis->controller_.move_to_pos(goal_point);
-            axis->watchdog_feed();
-        }
-
-    } else if (cmd[0] == 'f') { // feedback
-        unsigned motor_number;
-        int numscan = sscanf(cmd, "f %u", &motor_number);
-        if (numscan < 1) {
-            tprespond(response_channel, use_checksum, "invalid command format");
-        } else if (motor_number >= AXIS_COUNT) {
-            tprespond(response_channel, use_checksum, "invalid motor %u", motor_number);
-        } else {
-            tprespond(response_channel, use_checksum, "%f %f",
-                    (double)axes[motor_number]->encoder_.pos_estimate_,
-                    (double)axes[motor_number]->encoder_.vel_estimate_);
-        }
-    } else if (cmd[0] == 'z') { // Zero encoder                 XXX MPL XXX
-        unsigned motor_number;
-        int numscan = sscanf(cmd,"z %u", &motor_number);;
-        if (numscan < 1) {
-            tprespond(response_channel, use_checksum, "invalid command format");
-        } else if (motor_number >= AXIS_COUNT) {
-            tprespond(response_channel, use_checksum, "invalid motor %u", motor_number);
-        } else {
-            if (axes[motor_number]->current_state_ == Axis::AXIS_STATE_IDLE) {
-                axes[motor_number]->encoder_.set_linear_count(0);
+            if (a < AXIS_COUNT) {
+                f0 = tcpkt_getfloat(rxpkt,0);      // target position
+                f1 = tcpkt_getfloat(rxpkt,1);      // max velocity
+                axis = axes[a];
+                axis->controller_.set_pos_setpoint(f0, 0.0, 0.0);
+                axis->controller_.config_.vel_limit = f1;
+                axis->watchdog_feed();
             } else {
-                tprespond(response_channel,use_checksum,"motor state must be idle to zero encoder");
+                txpkt->packet.tc_sts = TCSTS_ERR_PARAM;
             }
-        }
-    } else if (cmd[0] == 's') { // status; position, velocity   XXX MPL XXX
-        unsigned motor_number;
-        int numscan = sscanf(cmd, "s %u", &motor_number);
-        if (numscan < 1) {
-            tprespond(response_channel, use_checksum, "%f %f %f %f",
-                    (double)axes[0]->encoder_.pos_estimate_,
-                    (double)axes[0]->encoder_.vel_estimate_,
-                    (double)axes[1]->encoder_.pos_estimate_,
-                    (double)axes[1]->encoder_.vel_estimate_
-                    );
-            //tprespond(response_channel, use_checksum, "invalid command format");
-        } else if (motor_number >= AXIS_COUNT) {
-            tprespond(response_channel, use_checksum, "invalid motor %u", motor_number);
-        } else {
-            tprespond(response_channel, use_checksum, "%f %f %f",
-                    (double)axes[motor_number]->encoder_.pos_estimate_,
-                    (double)axes[motor_number]->encoder_.vel_estimate_,
-                    (double)axes[motor_number]->motor_.current_control_.Iq_measured);
-        }
-    } else if (cmd[0] == 'k') {  // wait for axis     XXX MPL XXX
-        unsigned max_wait;
-        unsigned cur_wait;
-        int numscan = sscanf(cmd, "k %u", &max_wait);
-        if (numscan < 1) {
-            max_wait = 250;
-        }
+            break;
 
-        cur_wait = 0;
-        while (cur_wait < max_wait) {
-            if ((axes[0]->encoder_.vel_estimate_ == 0.0f) &&
-                (axes[1]->encoder_.vel_estimate_ == 0.0f)) {
-                break;
-            }
-            osDelay(1);
-            cur_wait++;
-        }
+        case TCCMD_TRAPTRAJ:
+            a = (unsigned int) tcpkt_getint(rxpkt,0);       // selected axis
 
-        tprespond(response_channel, use_checksum, "%u %f %f %f %f",
-                cur_wait,
-                (double)axes[0]->encoder_.pos_estimate_,
-                (double)axes[0]->encoder_.vel_estimate_,
-                (double)axes[1]->encoder_.pos_estimate_,
-                (double)axes[1]->encoder_.vel_estimate_
-            );
-
-    } else if (cmd[0] == 'h') {  // Help
-        tprespond(response_channel, use_checksum, "This is the touchbot protocol version");
-    } else if (cmd[0] == 'i'){ // Dump device info
-        // tprespond(response_channel, use_checksum, "Signature: %#x", STM_ID_GetSignature());
-        // tprespond(response_channel, use_checksum, "Revision: %#x", STM_ID_GetRevision());
-        // tprespond(response_channel, use_checksum, "Flash Size: %#x KiB", STM_ID_GetFlashSize());
-        tprespond(response_channel, use_checksum, "Hardware version: %d.%d-%dV", HW_VERSION_MAJOR, HW_VERSION_MINOR, HW_VERSION_VOLTAGE);
-        tprespond(response_channel, use_checksum, "Firmware version: %d.%d.%d", FW_VERSION_MAJOR, FW_VERSION_MINOR, FW_VERSION_REVISION);
-        tprespond(response_channel, use_checksum, "Serial number: %s", serial_number_str);
-
-    } else if (cmd[0] == 's'){ // System
-        if(cmd[1] == 's') { // Save config
-            save_configuration();
-        } else if (cmd[1] == 'e'){ // Erase config
-            erase_configuration();
-        } else if (cmd[1] == 'r'){ // Reboot
-            NVIC_SystemReset();
-        }
-
-    } else if (cmd[0] == 'r') { // read property
-        char name[MAX_LINE_LENGTH];
-        int numscan = sscanf(cmd, "r %" TO_STR(MAX_LINE_LENGTH) "s", name);
-        if (numscan < 1) {
-            tprespond(response_channel, use_checksum, "invalid command format");
-        } else {
-            Endpoint* endpoint = application_endpoints_->get_by_name(name, sizeof(name));
-            if (!endpoint) {
-                tprespond(response_channel, use_checksum, "invalid property");
+            if (a < AXIS_COUNT) {
+                f0 = tcpkt_getfloat(rxpkt,0);      // goal position
+                axis = axes[a];
+                axis->controller_.move_to_pos(f0);
+                axis->watchdog_feed();
             } else {
+                txpkt->packet.tc_sts = TCSTS_ERR_PARAM;
+            }
+            break;
+            
+        case TCCMD_ZEROENCODER:
+            a = (unsigned int) tcpkt_getint(rxpkt,0);       // selected axis
+
+            if (a < AXIS_COUNT) {
+                axis = axes[a];
+                // Only works if axis state is 'idle'
+                if (axis->current_state_ == Axis::AXIS_STATE_IDLE) {
+                    axis->encoder_.set_linear_count(0);
+                } else {
+                    txpkt->packet.tc_sts = TCSTS_ERR_STATE;
+                }
+            } else {
+                txpkt->packet.tc_sts = TCSTS_ERR_PARAM;
+            }
+
+            break;
+
+        case TCCMD_STATUS:
+            tcpkt_addfloat(txpkt,axes[0]->encoder_.pos_estimate_);
+            tcpkt_addfloat(txpkt,axes[0]->encoder_.vel_estimate_);
+            tcpkt_addfloat(txpkt,axes[1]->encoder_.pos_estimate_);
+            tcpkt_addfloat(txpkt,axes[1]->encoder_.vel_estimate_);
+            tcpkt_addint(txpkt,system_stats_.uptime);
+            tcpkt_addint(txpkt,axes[0]->current_state_);
+            tcpkt_addint(txpkt,axes[1]->current_state_);
+            break;
+
+        case TCCMD_GETIPROP:
+            pname = tcpkt_getstring(rxpkt);
+            endpoint = application_endpoints_->get_by_name(pname, strlen(pname)+1);
+            i0 = 0;
+            if (endpoint) {
                 char response[10];
-                bool success = endpoint->get_string(response, sizeof(response));
-                if (!success)
-                    tprespond(response_channel, use_checksum, "not implemented");
-                else
-                    tprespond(response_channel, use_checksum, response);
-            }
-        }
 
-    } else if (cmd[0] == 'w') { // write property
-        char name[MAX_LINE_LENGTH];
-        char value[MAX_LINE_LENGTH];
-        int numscan = sscanf(cmd, "w %" TO_STR(MAX_LINE_LENGTH) "s %" TO_STR(MAX_LINE_LENGTH) "s", name, value);
-        if (numscan < 1) {
-            tprespond(response_channel, use_checksum, "invalid command format");
-        } else {
-            Endpoint* endpoint = application_endpoints_->get_by_name(name, sizeof(name));
-            if (!endpoint) {
-                tprespond(response_channel, use_checksum, "invalid property");
+                if (endpoint->get_string(response,sizeof(response))) {
+                    i0 = atoi(response);
+                } else {
+                    txpkt->packet.tc_sts = TCSTS_ERR_VALUE;
+                }
             } else {
-                bool success = endpoint->set_string(value, sizeof(value));
-                if (!success)
-                    tprespond(response_channel, use_checksum, "not implemented");
+                txpkt->packet.tc_sts = TCSTS_ERR_PARAM;
             }
-        }
+            tcpkt_addint(txpkt,i0);
+            break;
 
-    }else if (cmd[0] == 'u') { // Update axis watchdog. 
-        unsigned motor_number;
-        int numscan = sscanf(cmd, "u %u", &motor_number);
-        if(numscan < 1){
-            tprespond(response_channel, use_checksum, "invalid command format");
-        } else if (motor_number >= AXIS_COUNT) {
-            tprespond(response_channel, use_checksum, "invalid motor %u", motor_number);
-        }else {
-            axes[motor_number]->watchdog_feed();
-        }
+        case TCCMD_GETFPROP:
+            pname = tcpkt_getstring(rxpkt);
+            endpoint = application_endpoints_->get_by_name(pname, strlen(pname)+1);
+            f0 = 0.0;
+            if (endpoint) {
+                char response[10];
 
-    } else if (cmd[0] != 0) {
-        tprespond(response_channel, use_checksum, "unknown command");
+                if (endpoint->get_string(response,sizeof(response))) {
+                    f0 = strtof(response,NULL);
+                } else {
+                    txpkt->packet.tc_sts = TCSTS_ERR_VALUE;
+                }
+            } else {
+                txpkt->packet.tc_sts = TCSTS_ERR_PARAM;
+            }
+            tcpkt_addfloat(txpkt,f0);
+            break;
+
+        case TCCMD_SETIPROP:
+            pname = tcpkt_getstring(rxpkt);
+            i0 = tcpkt_getint(rxpkt,0);
+
+            // Can we set integer properties by float? less ugly.
+            endpoint = application_endpoints_->get_by_name(pname, strlen(pname)+1);
+            if (endpoint) {
+                char value[MAX_LINE_LENGTH];
+                snprintf(value,sizeof(value),"%d",(int)i0);
+                endpoint->set_string(value,sizeof(value));
+            } else {
+                txpkt->packet.tc_sts = TCSTS_ERR_PARAM;
+            }
+
+            break;
+
+        case TCCMD_SETFPROP:
+            pname = tcpkt_getstring(rxpkt);
+            f0 = tcpkt_getfloat(rxpkt,0);
+
+            endpoint = application_endpoints_->get_by_name(pname, strlen(pname)+1);
+            if (endpoint) {
+                endpoint->set_from_float(f0);
+            } else {
+                txpkt->packet.tc_sts = TCSTS_ERR_PARAM;
+            }
+            break;
+
+        case TCCMD_FEEDWATCHDOG:
+            axes[0]->watchdog_feed();
+            axes[1]->watchdog_feed();
+            break;
+
+        default:
+            txpkt->packet.tc_sts = TCSTS_ERR_CMD;
+            break;
     }
+
+
+    // Generate the CRC
+    txpkt->packet.tc_crc = crc16((char *) txpkt, (unsigned short) tcpkt_size(txpkt));
+
+    // Send back the response.
+    tprespond(response_channel,txpkt);
+
 }
 
-void touchbot_protocol_parse_stream(const uint8_t* buffer, size_t len, StreamSink& response_channel) {
-    static uint8_t parse_buffer[MAX_LINE_LENGTH];
-    static bool read_active = true;
-    static uint32_t parse_buffer_idx = 0;
 
-    while (len--) {
-        // if the line becomes too long, reset buffer and wait for the next line
-        if (parse_buffer_idx >= MAX_LINE_LENGTH) {
-            read_active = false;
-            parse_buffer_idx = 0;
-        }
+static bool touchbot_protocol_process_byte(uint8_t b)
+{
+    bool done = false;
 
-        // Fetch the next char
-        uint8_t c = *(buffer++);
-        bool is_end_of_line = (c == '\r' || c == '\n' || c == '!');
-        if (is_end_of_line) {
-            if (read_active)
-                touchbot_protocol_process_line(parse_buffer, parse_buffer_idx, response_channel);
-            parse_buffer_idx = 0;
-            read_active = true;
-        } else {
-            if (read_active) {
-                parse_buffer[parse_buffer_idx++] = c;
+    // First 4 states get us through checking the sync bytes.
+    switch (rxState) {
+        default:
+        case RXSTATE_SYNC0:
+            rxPtr = (uint8_t *) &rxpacket;
+            rxRemlen = 0;
+            if (b == TC_SEAL0) {
+                *rxPtr++ = b;
+                rxState = RXSTATE_SYNC1;
             }
+            break;
+
+        case RXSTATE_SYNC1:
+            if (b == TC_SEAL1) {
+                *rxPtr++ = b;
+                rxState = RXSTATE_SYNC2;
+            } else {
+                rxState = RXSTATE_SYNC0;
+            }
+            break;
+
+        case RXSTATE_SYNC2:
+            if (b == TC_SEAL2) {
+                *rxPtr++ = b;
+                rxState = RXSTATE_SYNC3;
+            } else {
+                rxState = RXSTATE_SYNC0;
+            }
+            break;
+
+        case RXSTATE_SYNC3:
+            if (b == TC_SEAL3) {
+                *rxPtr++ = b;
+                // the rest of the bytes of the header are the fixed part.
+                // so it's just the struct minus our seal.
+                rxRemlen = TC_HDRSIZE - sizeof(uint32_t);
+                rxState = RXSTATE_HEADER;
+            } else {
+                rxState = RXSTATE_SYNC0;
+            }
+            break;
+
+        case RXSTATE_HEADER:
+            *rxPtr++ = b;
+            rxRemlen--;
+
+            if (rxRemlen == 0) {
+                // compute the length of the payload.
+                rxRemlen = tcpkt_size(&rxpacket) - TC_HDRSIZE;
+
+                // If the remaining length is still zero, kick the packet out.
+                if (rxRemlen == 0) {
+                    done = true;                            // tell receive loop to process packet
+                    rxState = RXSTATE_SYNC0;                // back to sync state.
+                } else {
+                    rxState = RXSTATE_PAYLOAD;
+                }
+            }
+            break;
+
+        case RXSTATE_PAYLOAD:
+            *rxPtr++ = b;
+            rxRemlen--;
+
+            if (rxRemlen == 0) {
+                done = true;                            // tell receive loop to process packet
+                rxState = RXSTATE_SYNC0;                // back to syncs state.
+            }
+    }
+
+    return done;
+}
+
+void touchbot_protocol_parse_stream(const uint8_t* buffer, size_t len, StreamSink& response_channel) 
+{
+    while (len--) {
+        if (touchbot_protocol_process_byte(*buffer++)) {
+            unsigned short crc;
+            // process the packet.   The state has already been reset
+            // to start handling the next one.
+
+            // check CRC
+            crc = rxpacket.packet.tc_crc;
+            rxpacket.packet.tc_crc = 0;         // zero it before computing.
+            if (crc16((char *) &rxpacket, (unsigned short) tcpkt_size(&rxpacket)) != crc) {
+                // XXX handle bad CRC here.
+            }
+
+            // otherwise pass it up.
+            touchbot_protocol_process_packet(&rxpacket,response_channel);
         }
     }
 }
