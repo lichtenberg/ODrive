@@ -4,6 +4,7 @@ This project is all about accurately driving brushless motors, for cheap. The ai
 
 | Branch | Build Status |
 |--------|--------------|
+| DeusX | Apple modifications for Touch Robot, including a binary control protocol |
 | master | [![Build Status](https://travis-ci.org/madcowswe/ODrive.png?branch=master)](https://travis-ci.org/madcowswe/ODrive) |
 | devel  | [![Build Status](https://travis-ci.org/madcowswe/ODrive.png?branch=devel)](https://travis-ci.org/madcowswe/ODrive) |
 
